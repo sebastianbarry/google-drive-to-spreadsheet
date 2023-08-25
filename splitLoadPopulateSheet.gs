@@ -105,12 +105,15 @@ function recordAllFolders(folder, savedataSheet) {
 // Precondition: The content of the file rows should begin on row 3 and then extend to the row number equal to the number of files + 2
 // Precondition: The Savedata sheet contains one row in the list of folders named "Bookend" which acts as the cleanup old files indicator
 function populateDataWithFileCount(dataSheet, savedataSheet, rootFolderId, filecount = 500) {
-  var lastRow = savedataSheet.getLastRow();
+  var lastRow = savedataSheet.getRange('B1').getValue();
   var filesToLoad = 0;
   var foldersToLoad = [];
 
   // Initialization: Loop through the queue of folders in Savedata that equal up to the filecount and create a list of files and folders to be loaded
   for (var i = 3; filesToLoad <= filecount; i++) {
+    if (i > lastRow) {
+      i = 3; // Loop back to top of queue if we somehow get past it
+    }
     // Gather row details
     let currentRow = savedataSheet.getRange(`A${i}:E${i}`).getValues()[0];
     let folderId = currentRow[0];
@@ -122,12 +125,17 @@ function populateDataWithFileCount(dataSheet, savedataSheet, rootFolderId, filec
     // Essentially completing the loop; after we reach the beginning of the loop, make sure we do any housekeeping before restarting the loop
     if(folderId == "Bookend") {
       console.log("Hit the bookend, aborting current load and cleaning up old files");
-      currentRow[4] = new Date().toLocaleDateString();
+      currentRow[4] = new Date().toString();
       savedataSheet.deleteRow(i);
       i--;
-      savedataSheet.getRange(lastRow, 1, 1, currentRow.length).setValues([currentRow]); // Use sheet.getRange().setValues() here instead of sheet.appendRow() as it is MUCH more efficient on time
+      savedataSheet.getRange(lastRow + 1, 1, 1, currentRow.length).setValues([currentRow]); // Use sheet.getRange().setValues() here instead of sheet.appendRow() as it is MUCH more efficient on time
     }
 
+    // Delete empty rows
+    if (numFiles == "") {
+      savedataSheet.deleteRow(i);
+      savedataSheet.getRange('B1').setValue(savedataSheet.getLastRow());
+    }
     // Check whether we are at the filecount limit 
     if (filesToLoad + numFiles > filecount) {
       console.log(`Total files to load: ${filesToLoad} out of ${filecount} (${foldersToLoad.length} folders)`);
@@ -141,15 +149,16 @@ function populateDataWithFileCount(dataSheet, savedataSheet, rootFolderId, filec
       filesToLoad += numFiles;
     } else {
       // Skip folders that have 0 files in them; move them to the end of the Savedata sheet
-      currentRow[4] = new Date().toLocaleDateString();
+      currentRow[4] = new Date().toString();
       savedataSheet.deleteRow(i);
       i--;
-      savedataSheet.getRange(lastRow, 1, 1, currentRow.length).setValues([currentRow]); // Use sheet.getRange().setValues() here instead of sheet.appendRow() as it is MUCH more efficient on time
+      savedataSheet.getRange(lastRow + 1, 1, 1, currentRow.length).setValues([currentRow]); // Use sheet.getRange().setValues() here instead of sheet.appendRow() as it is MUCH more efficient on time
     }
   }
 
   // Gather current files: Create the object containing all current file IDs of files from the folders in the Drive
-  var currentIds = getListOfFileIds(foldersToLoad);
+  var currentIds = {};
+  [foldersToLoad, currentIds] = getListOfFileIds(foldersToLoad);
 
   // Compare to existing files: Search through and traverse all existing file records from the sheet to compare -> update, delete, and add
   compareAndUpdateSheet(dataSheet, savedataSheet, currentIds, foldersToLoad, lastRow);
@@ -198,21 +207,29 @@ function getFileCount(files) {
 
 // FUNCTIONS FOR POPULATE DATA //
 
-// Generates a large object to act as a dictionary for each file ID, while also containing useful data (lastUpdated and filePath) that can be passed on to getFileDetails
+// Generates a large object to act as a dictionary for each file ID, while also containing useful data (lastUpdated and filePath and mimeType and image) that can be passed on to getFileDetails
 function getListOfFileIds(folders) {
   var fileData = {};
+  var skipcount = 0;
 
   for (var i = 0; i < folders.length; i++) {
     var folder = DriveApp.getFolderById(folders[i][0])
     var fileIterator = folder.getFiles();
     while (fileIterator.hasNext()) {
       var file = fileIterator.next();
-      fileData[file.getId()] = [file.getLastUpdated(), folders[i][1]];
+      const [mimeType, image] = generateFileType(file.getMimeType().replace('application/', ''));
+      // Skip any files with non-important file types
+      if (mimeType == "skip") {
+        folders[i][3]--; // Decrement the file count for the given folder
+        skipcount++;
+        continue;
+      }
+      fileData[file.getId()] = [file.getLastUpdated(), folders[i][1], mimeType, image];
     }
   }
   
-  console.log('Gathered IDs for ', Object.keys(fileData).length, ' files');
-  return fileData;
+  console.log('Gathered IDs for ', Object.keys(fileData).length, ' files. Skipped ', skipcount, 'files');
+  return [folders, fileData];
 }
 
 function compareAndUpdateSheet(dataSheet, savedataSheet, currentFiles, foldersToLoad, savedataLastRow) {
@@ -223,7 +240,21 @@ function compareAndUpdateSheet(dataSheet, savedataSheet, currentFiles, foldersTo
   var foldersList = {};
   for (var i = 0; i < foldersToLoad.length; i++) {
     let folderPath = foldersToLoad[i][1];
-    foldersList[folderPath] = foldersToLoad[i][3];
+    // Requeue folders that already have 0 files to load
+    if (foldersToLoad[i][3] <= 0){
+      // Delete the row from savedataSheet and then add it to the end
+      var row = foldersToLoad[i];
+      row[4] = new Date().toString();
+      for (var j = 3; j <= foldersToLoad.length + 2; j++) {
+        if (savedataSheet.getRange(`B${j}`).getValue() == folderPath) {
+          savedataSheet.deleteRow(j);
+          savedataSheet.getRange(savedataLastRow + 1, 1, 1, row.length).setValues([row]); // Use sheet.getRange().setValues() here instead of sheet.appendRow() as it is MUCH more efficient on time
+          break;
+        }
+      }
+    } else {
+      foldersList[folderPath] = foldersToLoad[i][3];
+    }
   }
 
   // Go through every file in the dataSheet looking for files with a matching folder
@@ -250,7 +281,7 @@ function compareAndUpdateSheet(dataSheet, savedataSheet, currentFiles, foldersTo
       if (currentFiles[id][0].getDate() !== lastUpdated.getDate()) {
         console.log("Found outdated file in sheet, updating: " + id + " " + lastUpdated);
         // Update the file here
-        let rowData = getFileDetails(id, lastUpdated, folderPath);
+        let rowData = getFileDetails(id, lastUpdated, iPath);
         dataSheet.getRange(i, 1, 1, rowData.length).setValues([rowData]);
       } else {
         console.log("Found matching file, skipping: " + id + " " + lastUpdated);
@@ -268,14 +299,14 @@ function compareAndUpdateSheet(dataSheet, savedataSheet, currentFiles, foldersTo
       for (var j = 0; j < foldersToLoad.length; j++) {
         if (foldersToLoad[j][1] == iPath) {
           row = foldersToLoad[j];
-          row[4] = new Date() .toLocaleDateString();
+          row[4] = new Date().toString();
         }
       }
       // Delete the row from savedataSheet and then add it to the end
       for (var j = 3; j <= Object.keys(foldersList).length + 2; j++) {
         if (savedataSheet.getRange(`B${j}`).getValue() == iPath) {
           savedataSheet.deleteRow(j);
-          savedataSheet.getRange(savedataLastRow, 1, 1, row.length).setValues([row]); // Use sheet.getRange().setValues() here instead of sheet.appendRow() as it is MUCH more efficient on time
+          savedataSheet.getRange(savedataLastRow + 1, 1, 1, row.length).setValues([row]); // Use sheet.getRange().setValues() here instead of sheet.appendRow() as it is MUCH more efficient on time
           break;
         }
       }
@@ -287,28 +318,30 @@ function compareAndUpdateSheet(dataSheet, savedataSheet, currentFiles, foldersTo
     if (currentFiles.hasOwnProperty(fileId)) {
       let lastUpdated = currentFiles[fileId][0];
       let folderPath = currentFiles[fileId][1];
+      let mimeType = currentFiles[fileId][2];
+      let image = currentFiles[fileId][3];
       console.log("Found file that does not exist in the sheet, adding: " + fileId + " " + lastUpdated);
       
-      let rowData = getFileDetails(fileId, lastUpdated, folderPath);
+      let rowData = getFileDetails(fileId, lastUpdated, folderPath, mimeType, image);
       dataSheet.getRange(++lastRow, 1, 1, rowData.length).setValues([rowData]); // Use dataSheet.getRange().setValues() here instead of dataSheet.appendRow() as it is MUCH more efficient on time
       
       // Decrement the number of files left to load for the particular folder
       foldersList[folderPath]--;
       // Once the number of files left to load for one particular folder is 0, move the folder in the Savedata sheet queue to the end
-      if (foldersList[iPath] <= 0) {
+      if (foldersList[folderPath] <= 0) {
         // Get the row that will be added to the end of savedataSheet 
         var row = [];
         for (var j = 0; j < foldersToLoad.length; j++) {
-          if (foldersToLoad[j][1] == iPath) {
+          if (foldersToLoad[j][1] == folderPath) {
             row = foldersToLoad[j];
-            row[4] = new Date() .toLocaleDateString();
+            row[4] = new Date().toString();
           }
         }
         // Delete the row from savedataSheet and then add it to the end
         for (var j = 3; j <= Object.keys(foldersList).length + 2; j++) {
-          if (savedataSheet.getRange(`B${j}`).getValue() == iPath) {
+          if (savedataSheet.getRange(`B${j}`).getValue() == folderPath) {
             savedataSheet.deleteRow(j);
-            savedataSheet.getRange(savedataLastRow, 1, 1, row.length).setValues([row]); // Use sheet.getRange().setValues() here instead of sheet.appendRow() as it is MUCH more efficient on time
+            savedataSheet.getRange(savedataLastRow + 1, 1, 1, row.length).setValues([row]); // Use sheet.getRange().setValues() here instead of sheet.appendRow() as it is MUCH more efficient on time
             break;
           }
         }
@@ -317,18 +350,18 @@ function compareAndUpdateSheet(dataSheet, savedataSheet, currentFiles, foldersTo
   }
 }
 
-function getFileDetails(id, lastUpdated, filePath) {
+function getFileDetails(id, lastUpdated, filePath, mimeType, image) {
   var fileInfo = [];
   var file = DriveApp.getFileById(id);
 
   const title = file.getName();
   // id already was fetched earlier; passed in as parameter
   const url = file.getUrl();
-  const [mimeType, image] = generateFileType(file.getMimeType().replace('application/', ''));
+  //const [mimeType, image] = generateFileType(file.getMimeType().replace('application/', ''));
   const ownerInfo = "Undefined"; // We decided to not get the owner and ownerInfo since it always results in "Undefined" //const [ownerInfo, owner] = generateFileOwner(file.getOwner());
   const owner = "undefined";
-  const creationDate = file.getDateCreated();
-  // lastUpdated already was fetched earlier; passed in as parameter
+  const creationDate = file.getDateCreated().toLocaleDateString();
+  lastUpdated = lastUpdated.toLocaleDateString();
   // filePath already was fetched earlier; passed in as parameter
   const description = file.getDescription();
   const fileSize = formatFileSize(file.getSize());
@@ -349,15 +382,15 @@ function getFileDetails(id, lastUpdated, filePath) {
 // For each new file type we encounter, we will want to add a case here to handle it
 function generateFileType(mimeType) {
   var imageURL = "https://storage.googleapis.com/aw-gapps-ressources/at/addons/file-cabinet/assets/blank-empty-file-128.png";
-  if(mimeType.includes('document')) {
+  if(mimeType.includes('document') || mimeType.includes('word') || mimeType.includes('plain')) {
     mimeType = 'Document';
     imageURL = 'https://storage.googleapis.com/aw-gapps-ressources/at/addons/file-cabinet/assets/docs-128.png';
   }
-  else if (mimeType.includes('spreadsheet')) {
+  else if (mimeType.includes('spreadsheet') || mimeType.includes('csv') || mimeType.includes('excel')) {
     mimeType = 'Spreadsheet';
     imageURL = 'https://storage.googleapis.com/aw-gapps-ressources/at/addons/file-cabinet/assets/spreadsheets-128.png';
   }
-  else if (mimeType.includes('presentation')) {
+  else if (mimeType.includes('presentation') || mimeType.includes('powerpoint')) {
     mimeType = 'Presentation';
     imageURL = 'https://storage.googleapis.com/aw-gapps-ressources/at/addons/file-cabinet/assets/presentations-128.png';
   }
@@ -368,8 +401,15 @@ function generateFileType(mimeType) {
     mimeType = 'Drawing';
     imageURL = 'https://storage.googleapis.com/aw-gapps-ressources/at/addons/file-cabinet/assets/drawings-128.png'
   }
-  else if(mimeType.includes('shortcut')) {
-    mimeType = 'Shortcut';
+  //else if(mimeType.includes('shortcut')) {
+  //  mimeType = 'Shortcut';
+  //}
+  else if(mimeType.includes('pdf')) {
+    mimeType = 'PDF';
+    imageURL = 'https://www.science.co.il/internet/browsers/PDF-doc-256.png';
+  }
+  else{
+    mimeType = 'skip';
   }
   
   return [mimeType, imageURL];
